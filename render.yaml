@@ -14,6 +14,6 @@ services:
       - key: OWNER_ID
         value: "5684263622"
       - key: BOT_USERNAME
-        value: "KNIGHTXRAIGENvaultBOT"
+        value: "QUANTUM_VAULTbot"
       - key: WEBHOOK_SECRET
         generateValue: true
