@@ -1306,6 +1306,17 @@ def telegram_webhook(secret: str):
         return "not ready", 503
 
     payload = request.get_json(silent=True)
+    # Capture private/public channel ID
+channel_post = payload.get("channel_post") or payload.get("edited_channel_post")
+
+if channel_post:
+    chat = channel_post.get("chat", {})
+    log.warning(
+        "CHANNEL_ID_CAPTURE | Title: %s | ID: %s",
+        chat.get("title"),
+        chat.get("id")
+    )
+    
     if not isinstance(payload, dict):
         log.warning("Telegram webhook received invalid JSON")
         return "bad request", 400
@@ -1361,7 +1372,12 @@ def bootstrap() -> None:
             log.warning("Could not register bot commands", exc_info=True)
 
         external_url = os.getenv("WEBHOOK_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()
-        allowed_updates = ["message", "callback_query", "channel_post"]
+        allowed_updates=[
+    "message",
+    "callback_query",
+    "channel_post",
+    "edited_channel_post"
+], "channel_post"]
 
         # Set ready before setWebhook: Telegram can deliver queued updates immediately
         # after setWebhook succeeds. The previous order produced the observed 503 burst.
