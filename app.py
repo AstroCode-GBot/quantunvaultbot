@@ -57,7 +57,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("knight-vault")
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True, num_threads=8)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -789,6 +789,17 @@ def channel_list_text() -> str:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+@bot.message_handler(commands=["ping"])
+def cmd_ping(message: Any) -> None:
+    """Minimal diagnostic command to confirm Telegram updates reach handlers."""
+    if message.chat.type == "private":
+        log.info("/ping handled for user_id=%s", message.from_user.id)
+        bot.send_message(
+            message.chat.id,
+            "🏓 <b>PONG!</b> QUANTUM VAULT is receiving your messages."
+        )
+
+
 @bot.message_handler(commands=["start"])
 def cmd_start(message: Any) -> None:
     if message.chat.type != "private":
@@ -1291,15 +1302,40 @@ def telegram_webhook(secret: str):
     if not secrets.compare_digest(header_secret, WEBHOOK_SECRET):
         abort(403)
     if not BOOTSTRAPPED:
+        log.warning("Telegram update received before bootstrap completed")
         return "not ready", 503
+
     payload = request.get_json(silent=True)
-    if not payload:
+    if not isinstance(payload, dict):
+        log.warning("Telegram webhook received invalid JSON")
         return "bad request", 400
+
+    update_id = payload.get("update_id", "unknown")
+    message = payload.get("message") or payload.get("edited_message")
+    if isinstance(message, dict):
+        sender = message.get("from") or {}
+        chat = message.get("chat") or {}
+        text_value = message.get("text") or ""
+        command = text_value.split()[0][:80] if text_value.startswith("/") else "non-command"
+        content_type = next(
+            (key for key in ("photo", "document", "video", "audio", "text", "contact") if key in message),
+            "other",
+        )
+        log.info(
+            "Telegram update received: update_id=%s user_id=%s chat_type=%s type=%s command=%s",
+            update_id, sender.get("id", "?"), chat.get("type", "?"), content_type, command,
+        )
+    else:
+        log.info("Telegram update received: update_id=%s keys=%s", update_id, ",".join(payload.keys()))
+
     try:
         update = types.Update.de_json(json.dumps(payload))
+        # threaded=False means handlers run before this webhook returns 200,
+        # making handler failures visible in Render logs.
         bot.process_new_updates([update])
+        log.info("Telegram update handler finished: update_id=%s", update_id)
     except Exception:
-        log.exception("Webhook update processing failed")
+        log.exception("Webhook update processing failed: update_id=%s", update_id)
         return "error", 500
     return "ok", 200
 
@@ -1311,13 +1347,33 @@ def bootstrap() -> None:
         BOT_USERNAME = (me.username or BOT_USERNAME_FALLBACK).lstrip("@")
         BOT_DISPLAY_NAME = user_full_name(me)
         load_state()
+
+        # Register menu commands before exposing the webhook.
+        try:
+            bot.set_my_commands([
+                types.BotCommand("start", "Open the vault"),
+                types.BotCommand("ping", "Check bot response"),
+                types.BotCommand("myfiles", "View your personal files"),
+                types.BotCommand("help", "How to use the vault"),
+                types.BotCommand("admin", "Admin control panel"),
+            ])
+        except Exception:
+            log.warning("Could not register bot commands", exc_info=True)
+
         external_url = os.getenv("WEBHOOK_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()
+        allowed_updates = ["message", "callback_query", "channel_post"]
+
+        # Set ready before setWebhook: Telegram can deliver queued updates immediately
+        # after setWebhook succeeds. The previous order produced the observed 503 burst.
+        BOOTSTRAPPED = True
+        BOOTSTRAP_ERROR = None
+
         if external_url:
             webhook_url = external_url.rstrip("/") + "/telegram/" + WEBHOOK_SECRET
             bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET,
-                allowed_updates=["message", "callback_query"],
+                allowed_updates=allowed_updates,
                 drop_pending_updates=False,
             )
             log.info("Webhook configured: %s", external_url)
@@ -1325,28 +1381,22 @@ def bootstrap() -> None:
             # Local development fallback. Render supplies RENDER_EXTERNAL_URL and uses webhooks.
             bot.remove_webhook()
             thread = threading.Thread(
-                target=lambda: bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30, allowed_updates=["message", "callback_query"]),
+                target=lambda: bot.infinity_polling(
+                    skip_pending=True,
+                    timeout=30,
+                    long_polling_timeout=30,
+                    allowed_updates=allowed_updates,
+                ),
                 daemon=True,
             )
             thread.start()
             log.info("Local long-polling thread started")
-        try:
-            bot.set_my_commands([
-                types.BotCommand("start", "Open the vault"),
-                types.BotCommand("myfiles", "View your personal files"),
-                types.BotCommand("help", "How to use the vault"),
-                types.BotCommand("admin", "Admin control panel"),
-            ])
-        except Exception:
-            log.warning("Could not register bot commands", exc_info=True)
-        BOOTSTRAPPED = True
-        BOOTSTRAP_ERROR = None
+
         log.info("KNIGHT X RAIGEN VAULT is online as @%s", BOT_USERNAME)
     except Exception as exc:
         BOOTSTRAPPED = False
         BOOTSTRAP_ERROR = str(exc)
         log.exception("Vault bootstrap failed")
-        # Keep the health page available so the setup error is visible in Render logs/UI.
 
 
 bootstrap()
