@@ -26,7 +26,7 @@ from telebot import types
 # Configuration
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9102224053:AAFdY3-fRXn8cQXNLrm-l448A9t4kBVnCwI").strip()
-STORAGE_CHAT_ID_RAW = os.getenv("STORAGE_CHAT_ID", "-1004332207148").strip()
+STORAGE_CHAT_ID_RAW = os.getenv("STORAGE_CHAT_ID", "-1004367924445").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "5684263622"))
 BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME", "@QUANTUM_VAULTbot").lstrip("@").strip()
 MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MiB
