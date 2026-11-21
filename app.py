@@ -25,12 +25,12 @@ from telebot import types
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-STORAGE_CHAT_ID_RAW = os.getenv("STORAGE_CHAT_ID", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9102224053:AAFdY3-fRXn8cQXNLrm-l448A9t4kBVnCwI").strip()
+STORAGE_CHAT_ID_RAW = os.getenv("STORAGE_CHAT_ID", "-1004332207148").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "5684263622"))
-BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME", "KNIGHTXRAIGENvaultBOT").lstrip("@").strip()
+BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME", "@QUANTUM_VAULTbot").lstrip("@").strip()
 MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MiB
-INDEX_CAPTION = "KNIGHT_X_RAIGEN_VAULT_INDEX_V1"
+INDEX_CAPTION = "QUANTUM VAULT"
 CREDIT_TEXT = "DEVELOPER CREDITS\n@QUANTUM_NULL || @RAIGENBRO"
 PAGE_SIZE = 5
 
@@ -74,7 +74,7 @@ STATE: Dict[str, Any] = {
 }
 INDEX_MESSAGE_ID: Optional[int] = None
 BOT_USERNAME = BOT_USERNAME_FALLBACK
-BOT_DISPLAY_NAME = "KNIGHT X RAIGEN VAULT"
+BOT_DISPLAY_NAME = "QUANTUM VAULT"
 BOOTSTRAP_ERROR: Optional[str] = None
 BOOTSTRAPPED = False
 BROADCAST_PENDING: Dict[int, str] = {}
@@ -277,7 +277,7 @@ def main_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
 def home_text(user: Any) -> str:
     name = escape(getattr(user, "first_name", "there") or "there")
     return (
-        "<b>⚔️ KNIGHT X RAIGEN VAULT</b>\n"
+        "<b>⚔️ QUANTUM VAULT</b>\n"
         "<i>Your personal Telegram cloud vault.</i>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"Welcome, <b>{name}</b>!\n\n"
@@ -321,7 +321,7 @@ def send_verification_prompt(chat_id: int, note: str = "", pending_token: Option
     text = (
         "<b>🔐 CHANNEL VERIFICATION REQUIRED</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "To use KNIGHT X RAIGEN VAULT, join every required channel below, then tap <b>I Joined — Verify</b>.\n\n"
+        "To use QUANTUM VAULT, join every required channel below, then tap <b>I Joined — Verify</b>.\n\n"
         "Until verification is complete, uploads, downloads and shared links stay locked.\n"
         "━━━━━━━━━━━━━━━━━━"
     )
@@ -497,7 +497,7 @@ def store_upload(message: Any) -> None:
         bot.reply_to(message, "⛔ <b>File too large!</b>\nMaximum allowed size is <b>100 MB</b>.")
         return
 
-    status_msg = bot.reply_to(message, "⏳ <b>Uploading to KNIGHT Vault…</b>")
+    status_msg = bot.reply_to(message, "⏳ <b>Uploading to QUANTUM Vault…</b>")
     try:
         if kind == "text/code":
             # Text/code is stored as a Telegram message, not as a local file.
@@ -682,7 +682,7 @@ def show_admin_panel(chat_id: int, user_id: int) -> None:
         return
     bot.send_message(
         chat_id,
-        "<b>👑 KNIGHT VAULT · CONTROL PANEL</b>\n"
+        "<b>👑 QUANTUM VAULT · CONTROL PANEL</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"<b>Owner UID:</b> <code>{OWNER_ID}</code>\n"
         f"<b>Admins:</b> {len(STATE.get('admins', [])) + 1}\n"
