@@ -79,6 +79,11 @@ BOOTSTRAP_ERROR: Optional[str] = None
 BOOTSTRAPPED = False
 BROADCAST_PENDING: Dict[int, str] = {}
 BROADCAST_LOCK = threading.Lock()
+UPLOAD_DRAFTS: Dict[int, Dict[str, Any]] = {}
+UPLOAD_DRAFT_LOCK = threading.RLock()
+UPLOAD_DRAFT_TTL = 30 * 60
+MAX_TITLE_LENGTH = 120
+MAX_CAPTION_LENGTH = 800
 
 
 def now_iso() -> str:
@@ -281,7 +286,7 @@ def home_text(user: Any) -> str:
         "<i>Your personal Telegram cloud vault.</i>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"Welcome, <b>{name}</b>!\n\n"
-        "📤 Send any supported file, image, video, audio or code/text here.\n"
+        "📤 Send a file, then add its own title and caption.\n"
         "🔗 Get a private share link for every upload.\n"
         "📁 Only you can see your personal vault list.\n"
         "🛡️ Files are stored in Telegram cloud storage.\n"
@@ -421,14 +426,38 @@ def get_upload_details(message: Any) -> Tuple[str, str, int, bool, str]:
     return kind, filename, size, caption_supported, caption
 
 
-def safe_caption(original: str) -> str:
-    suffix = "\n\n" + CREDIT_TEXT
-    # Telegram media captions have a 1024-character limit after HTML parsing.
-    room = max(0, 1024 - len(suffix))
-    base = original or ""
-    if len(base) > room:
-        base = base[: max(0, room - 18)] + "… [caption cut]"
-    return escape(base) + suffix
+def truncate_utf16(value: str, max_units: int) -> str:
+    """Truncate text by UTF-16 code units (Telegram's caption length metric)."""
+    output: List[str] = []
+    used = 0
+    for char in value:
+        units = 2 if ord(char) > 0xFFFF else 1
+        if used + units > max_units:
+            break
+        output.append(char)
+        used += units
+    return "".join(output)
+
+
+def safe_caption(title: str, caption: str) -> str:
+    """Build a media caption with title, description and developer credits."""
+    clean_title = (title or "Untitled file").strip()[:MAX_TITLE_LENGTH]
+    reserve = len((clean_title + "\n\n" + CREDIT_TEXT).encode("utf-16-le")) // 2
+    available = max(0, 1024 - reserve)
+    clean_caption = truncate_utf16((caption or "").strip(), min(MAX_CAPTION_LENGTH, available))
+    parts = [f"<b>{escape(clean_title)}</b>"]
+    if clean_caption:
+        parts.append(escape(clean_caption))
+    parts.append(escape(CREDIT_TEXT))
+    return "\n\n".join(parts)
+
+
+def build_metadata_text(title: str, caption: str) -> str:
+    lines = ["<b>📄 FILE TITLE</b>", escape((title or "Untitled file")[:MAX_TITLE_LENGTH])]
+    if caption:
+        lines.extend(["", "<b>📝 CAPTION</b>", escape(caption[:MAX_CAPTION_LENGTH])])
+    lines.extend(["", "━━━━━━━━━━━━━━━━━━", escape(CREDIT_TEXT)])
+    return "\n".join(lines)
 
 
 def safe_html_text(original: str, output_limit: int) -> str:
@@ -448,10 +477,12 @@ def notify_admins_file(record: Dict[str, Any]) -> None:
     uid = int(record["owner_id"])
     username = record.get("owner_username")
     owner_name = record.get("owner_name") or "Unknown"
+    title = record.get("title") or record.get("filename") or "Untitled file"
     caption = record.get("caption") or "—"
     text = (
         "<b>📥 NEW FILE UPLOADED</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Title:</b> {escape(title)}\n"
         f"<b>File:</b> {escape(record.get('filename'))}\n"
         f"<b>Type:</b> {escape(record.get('kind'))}\n"
         f"<b>Size:</b> {escape(format_size(record.get('size', 0)))}\n"
@@ -486,59 +517,109 @@ def format_size(size: int) -> str:
     return f"{size} B"
 
 
-def store_upload(message: Any) -> None:
+def begin_upload_metadata(message: Any) -> None:
+    """Ask the uploader for a custom title and caption before saving the file."""
     user = message.from_user
     uid = int(user.id)
-    if not require_access(message, uid, message.chat.id):
+    chat_id = int(message.chat.id)
+    if not require_access(message, uid, chat_id):
         return
 
-    kind, filename, size, caption_supported, caption = get_upload_details(message)
+    kind, filename, size, caption_supported, original_caption = get_upload_details(message)
     if size > MAX_FILE_BYTES:
         bot.reply_to(message, "⛔ <b>File too large!</b>\nMaximum allowed size is <b>100 MB</b>.")
         return
+    if kind == "text/code":
+        original_caption = ""
 
-    status_msg = bot.reply_to(message, "⏳ <b>Uploading to QUANTUM Vault…</b>")
+    with UPLOAD_DRAFT_LOCK:
+        if uid in UPLOAD_DRAFTS:
+            bot.reply_to(message, "⚠️ You already have an upload waiting for its title/caption. Finish it or send /cancel first.")
+            return
+
+    prompt = bot.reply_to(
+        message,
+        "<b>📝 FILE DETAILS · STEP 1/2</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Send a <b>title</b> for this file.\n"
+        f"Example: <code>{escape(os.path.splitext(filename)[0][:50])}</code>\n\n"
+        "Send /skip to use the original filename, or /cancel to stop."
+    )
+    draft = {
+        "user_id": uid,
+        "chat_id": chat_id,
+        "source_message_id": int(message.message_id),
+        "kind": kind,
+        "filename": filename,
+        "size": int(size or 0),
+        "caption_supported": bool(caption_supported),
+        "original_caption": original_caption or "",
+        "owner_name": user_full_name(user),
+        "owner_username": getattr(user, "username", None),
+        "phase": "title",
+        "prompt_message_id": int(prompt.message_id),
+        "created_at_epoch": time.time(),
+    }
+    with UPLOAD_DRAFT_LOCK:
+        UPLOAD_DRAFTS[uid] = draft
+    log.info("Upload metadata wizard started: user_id=%s message_id=%s", uid, message.message_id)
+
+
+def finish_upload_metadata(message: Any, draft: Dict[str, Any]) -> None:
+    """Copy the original Telegram message to storage with its metadata attached."""
+    uid = int(draft["user_id"])
+    chat_id = int(draft["chat_id"])
+    title = (draft.get("title") or draft.get("filename") or "Untitled file").strip()[:MAX_TITLE_LENGTH]
+    caption = (draft.get("caption") or "").strip()[:MAX_CAPTION_LENGTH]
+
+    verified, missing = check_verification(uid)
+    if not verified:
+        send_verification_prompt(chat_id, f"Please join: {missing}")
+        return
+
     try:
-        if kind == "text/code":
-            # Text/code is stored as a Telegram message, not as a local file.
-            text_suffix = "\n\n" + CREDIT_TEXT
-            stored_text = safe_html_text(caption, 4096 - len(text_suffix)) + text_suffix
-            stored = bot.send_message(
-                STORAGE_CHAT_ID,
-                stored_text,
-                disable_web_page_preview=True,
-            )
-            storage_message_id = int(stored.message_id)
-            credit_message_id = None
-            original_caption = caption
-        else:
-            copy_kwargs: Dict[str, Any] = {}
-            credit_message_id = None
-            if caption_supported:
-                copy_kwargs["caption"] = safe_caption(caption)
+        try:
+            bot.delete_message(chat_id, int(draft.get("prompt_message_id", 0)))
+        except Exception:
+            pass
+
+        status_msg = bot.send_message(chat_id, "⏳ <b>Saving your file to QUANTUM VAULT…</b>")
+        credit_message_id = None
+
+        if draft["caption_supported"]:
             copied = bot.copy_message(
                 STORAGE_CHAT_ID,
-                message.chat.id,
-                message.message_id,
+                chat_id,
+                int(draft["source_message_id"]),
+                caption=safe_caption(title, caption),
                 parse_mode="HTML",
-                **copy_kwargs,
             )
             storage_message_id = int(copied.message_id)
-            if not caption_supported:
-                credit_msg = bot.send_message(STORAGE_CHAT_ID, CREDIT_TEXT, disable_notification=True)
-                credit_message_id = int(credit_msg.message_id)
-            original_caption = caption
+        else:
+            copied = bot.copy_message(
+                STORAGE_CHAT_ID,
+                chat_id,
+                int(draft["source_message_id"]),
+            )
+            storage_message_id = int(copied.message_id)
+            metadata_msg = bot.send_message(
+                STORAGE_CHAT_ID,
+                build_metadata_text(title, caption),
+                disable_web_page_preview=True,
+            )
+            credit_message_id = int(metadata_msg.message_id)
 
         token = secrets.token_urlsafe(9).replace("-", "a").replace("_", "b")[:12]
         record = {
             "token": token,
             "owner_id": uid,
-            "owner_name": user_full_name(user),
-            "owner_username": getattr(user, "username", None),
-            "filename": filename,
-            "kind": kind,
-            "size": int(size or 0),
-            "caption": original_caption,
+            "owner_name": draft.get("owner_name") or "Unknown",
+            "owner_username": draft.get("owner_username"),
+            "filename": draft.get("filename") or "file",
+            "title": title,
+            "kind": draft.get("kind") or "unknown",
+            "size": int(draft.get("size", 0) or 0),
+            "caption": caption,
             "storage_message_id": storage_message_id,
             "credit_message_id": credit_message_id,
             "created_at": now_iso(),
@@ -547,11 +628,11 @@ def store_upload(message: Any) -> None:
             STATE["files"][token] = record
         save_state()
 
-        # Replace the temporary status with a polished result card.
         try:
-            bot.delete_message(message.chat.id, status_msg.message_id)
+            bot.delete_message(chat_id, status_msg.message_id)
         except Exception:
             pass
+
         link = start_link(token)
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.row(
@@ -560,30 +641,92 @@ def store_upload(message: Any) -> None:
         )
         kb.add(types.InlineKeyboardButton("📁 My Vault", callback_data="my:0"))
         bot.send_message(
-            message.chat.id,
+            chat_id,
             "<b>✅ FILE SAVED SUCCESSFULLY</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Name:</b> {escape(filename)}\n"
-            f"<b>Type:</b> {escape(kind)}\n"
-            f"<b>Size:</b> {escape(format_size(size))}\n\n"
+            f"<b>Title:</b> {escape(title)}\n"
+            f"<b>Filename:</b> {escape(record['filename'])}\n"
+            f"<b>Type:</b> {escape(record['kind'])}\n"
+            f"<b>Size:</b> {escape(format_size(record['size']))}\n"
+            f"<b>Caption:</b> {escape(caption or '—')}\n\n"
             "<b>Your share link:</b>\n"
             f"<code>{escape(link)}</code>\n\n"
-            "Anyone with this link can open the file (after channel verification, if enabled).\n\n"
+            "Anyone with this link can open the file after required channel verification.\n\n"
             f"<i>{escape(CREDIT_TEXT)}</i>",
             reply_markup=kb,
             disable_web_page_preview=True,
         )
         notify_admins_file(record)
+        log.info("Upload saved: user_id=%s token=%s title=%s", uid, token, title)
+
     except Exception as exc:
-        log.exception("Upload failed for user %s", uid)
-        try:
-            bot.edit_message_text(
-                "❌ <b>Upload failed.</b> Please try again.\n\n<i>" + escape(str(exc)[:300]) + "</i>",
-                message.chat.id,
-                status_msg.message_id,
-            )
-        except Exception:
-            bot.reply_to(message, "❌ Upload failed. Check the bot's storage channel permissions and try again.")
+        log.exception("Upload finalization failed for user %s", uid)
+        bot.send_message(
+            chat_id,
+            "❌ <b>Upload failed.</b> Please check storage channel permissions and try again.\n\n"
+            "<i>" + escape(str(exc)[:250]) + "</i>",
+        )
+
+
+def handle_upload_metadata_reply(message: Any, draft: Dict[str, Any]) -> None:
+    """Process the title and caption text entered after the file upload."""
+    uid = int(message.from_user.id)
+    if time.time() - float(draft.get("created_at_epoch", time.time())) > UPLOAD_DRAFT_TTL:
+        with UPLOAD_DRAFT_LOCK:
+            UPLOAD_DRAFTS.pop(uid, None)
+        bot.reply_to(message, "⌛ This upload draft expired. Please send the file again.")
+        return
+
+    if message.content_type != "text":
+        bot.reply_to(message, "Please send the title/caption as text, or use /cancel to cancel this upload.")
+        return
+
+    value = (message.text or "").strip()
+    if not value:
+        bot.reply_to(message, "Please send some text, or use /skip.")
+        return
+
+    if draft.get("phase") == "title":
+        title = os.path.splitext(draft.get("filename") or "file")[0] if value.lower() == "/skip" else value
+        if len(title) > MAX_TITLE_LENGTH:
+            bot.reply_to(message, f"Title is too long. Please keep it under {MAX_TITLE_LENGTH} characters.")
+            return
+        draft["title"] = title or "Untitled file"
+        draft["phase"] = "caption"
+        with UPLOAD_DRAFT_LOCK:
+            UPLOAD_DRAFTS[uid] = draft
+        original = draft.get("original_caption") or ""
+        original_note = "\nSend /skip to keep the original Telegram caption." if original else "\nSend /skip to leave the caption empty."
+        caption_prompt = bot.reply_to(
+            message,
+            "<b>📝 FILE DETAILS · STEP 2/2</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Now send a <b>caption/description</b> for your file."
+            + original_note
+            + "\n\nSend /cancel to stop."
+        )
+        draft["prompt_message_id"] = int(caption_prompt.message_id)
+        with UPLOAD_DRAFT_LOCK:
+            UPLOAD_DRAFTS[uid] = draft
+        return
+
+    if draft.get("phase") == "caption":
+        if value.lower() == "/skip":
+            caption = draft.get("original_caption") or ""
+        else:
+            caption = value
+        if len(caption) > MAX_CAPTION_LENGTH:
+            bot.reply_to(message, f"Caption is too long. Please keep it under {MAX_CAPTION_LENGTH} characters.")
+            return
+        draft["caption"] = caption
+        with UPLOAD_DRAFT_LOCK:
+            UPLOAD_DRAFTS.pop(uid, None)
+        finish_upload_metadata(message, draft)
+        return
+
+    with UPLOAD_DRAFT_LOCK:
+        UPLOAD_DRAFTS.pop(uid, None)
+    bot.reply_to(message, "Upload draft reset. Please send your file again.")
 
 
 def deliver_file(chat_id: int, token: str) -> bool:
@@ -629,8 +772,9 @@ def show_my_files(chat_id: int, user_id: int, page: int = 0) -> None:
     ]
     for number, record in enumerate(chunk, start=page * PAGE_SIZE + 1):
         lines.append(
-            f"<b>{number}. {escape(record.get('filename'))}</b>\n"
-            f"{escape(record.get('kind'))} · {escape(format_size(int(record.get('size', 0))))} · {escape(record.get('created_at', ''))}"
+            f"<b>{number}. {escape(record.get('title') or record.get('filename'))}</b>\n"
+            f"{escape(record.get('filename'))} · {escape(record.get('kind'))} · {escape(format_size(int(record.get('size', 0))))}\n"
+            f"{escape(record.get('created_at', ''))}"
         )
         kb.row(
             types.InlineKeyboardButton("📥 Open", callback_data="op:" + record["token"]),
@@ -658,8 +802,8 @@ def admin_files_page(chat_id: int, page: int = 0) -> None:
     lines = [f"<b>🗂 RECENT UPLOADS · {len(rows)} total</b>", "━━━━━━━━━━━━━━━━━━"]
     for record in chunk:
         lines.append(
-            f"<b>{escape(record.get('filename'))}</b>\n"
-            f"{escape(record.get('owner_name'))} · <code>{record.get('owner_id')}</code>\n"
+            f"<b>{escape(record.get('title') or record.get('filename'))}</b>\n"
+            f"{escape(record.get('filename'))} · {escape(record.get('owner_name'))} · <code>{record.get('owner_id')}</code>\n"
             f"{escape(format_size(int(record.get('size', 0))))} · {escape(record.get('created_at', ''))}"
         )
         kb.add(types.InlineKeyboardButton("📥 Download · " + record["token"][:6], callback_data="ad:" + record["token"]))
@@ -836,9 +980,10 @@ def cmd_help(message: Any) -> None:
         "<b>ℹ️ HOW TO USE YOUR VAULT</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "1. Send a photo, video, document, audio, sticker, voice note or code/text.\n"
-        "2. Add a caption before sending, if needed.\n"
-        "3. The bot saves it and creates a share link.\n"
-        "4. Open <b>My Vault</b> to view, share or delete your own items.\n\n"
+        "2. The bot asks you to enter a title, then a caption/description.\n"
+        "3. Use /skip for the original filename or an empty caption; use /cancel to stop.\n"
+        "4. The bot saves your file and creates a share link.\n"
+        "5. Open <b>My Vault</b> to view, share or delete your own items.\n\n"
         "<b>Maximum:</b> 100 MB per item.\n"
         "<b>Phone number:</b> only visible after you voluntarily share your contact.\n\n"
         f"{escape(CREDIT_TEXT)}",
@@ -959,8 +1104,16 @@ def cmd_broadcast_admin(message: Any) -> None:
 
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message: Any) -> None:
-    BROADCAST_PENDING.pop(int(message.from_user.id), None)
-    bot.reply_to(message, "✅ Cancelled.")
+    uid = int(message.from_user.id)
+    broadcast = BROADCAST_PENDING.pop(uid, None)
+    with UPLOAD_DRAFT_LOCK:
+        upload = UPLOAD_DRAFTS.pop(uid, None)
+    if upload:
+        bot.reply_to(message, "✅ File title/caption entry cancelled. The file was not saved.")
+    elif broadcast:
+        bot.reply_to(message, "✅ Broadcast cancelled.")
+    else:
+        bot.reply_to(message, "✅ Nothing was pending.")
 
 
 @bot.message_handler(commands=["addchannel"])
@@ -1097,6 +1250,12 @@ def handle_any_message(message: Any) -> None:
         bot.send_message(message.chat.id, "⛔ Your access to this vault has been restricted.")
         return
 
+    with UPLOAD_DRAFT_LOCK:
+        pending_upload = UPLOAD_DRAFTS.get(uid)
+    if pending_upload:
+        handle_upload_metadata_reply(message, pending_upload)
+        return
+
     text = (getattr(message, "text", None) or "").strip()
     if text == "📁 My Vault":
         if require_access(message, uid, message.chat.id):
@@ -1104,7 +1263,7 @@ def handle_any_message(message: Any) -> None:
         return
     if text == "📤 Upload File":
         if require_access(message, uid, message.chat.id):
-            bot.send_message(message.chat.id, "📤 Send your file, image, video, audio or code/text now. You can add a Telegram caption before sending.")
+            bot.send_message(message.chat.id, "📤 Send your file, image, video, audio or code/text. I will then ask for a title and caption.")
         return
     if text == "ℹ️ Help":
         if require_access(message, uid, message.chat.id):
@@ -1126,7 +1285,7 @@ def handle_any_message(message: Any) -> None:
         return
 
     bot.send_chat_action(message.chat.id, "typing")
-    store_upload(message)
+    begin_upload_metadata(message)
 
 # ---------------------------------------------------------------------------
 # Inline callbacks
